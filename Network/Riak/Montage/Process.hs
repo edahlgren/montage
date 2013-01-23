@@ -54,14 +54,14 @@ requestTimeout :: Int
 requestTimeout = 30 * 1000000 -- 30s
 
 data ConcurrentState = ConcurrentState {
-      concurrentCount :: TVar Int
+      concurrentCount :: TVar (HM.HashMap PoolName Int)
     , tick            :: TVar Int
     , ts              :: TVar Double
     , pipeline        :: TVar (HM.HashMap (RT.Bucket, RT.Key) (TMVar (Either SomeException CommandResponse)))
     }
 
 newEmptyConcurrentState :: IO ConcurrentState
-newEmptyConcurrentState = ConcurrentState <$> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO HM.empty
+newEmptyConcurrentState = ConcurrentState <$> newTVarIO HM.empty <*> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO HM.empty
 
 -- TODO -- include subrequests as part of hash key?
 pipelineGet :: (MontageRiakValue t) => ConcurrentState -> ChainCommand t
@@ -109,9 +109,8 @@ runWithTimeout action = do
         Nothing -> do
             error "montage request timeout!"
 
-trackConcurrency :: ConcurrentState -> Int -> LogCallback -> IO CommandResponse
-                 -> IO CommandResponse
-trackConcurrency state maxRequests' logCB action = do
+trackConcurrency :: ConcurrentState -> Int -> LogCallback -> TrackChooser -> RT.Bucket -> IO a -> IO a
+trackConcurrency state maxRequests' logCB tchooser buck action = do
     mcount <- maybeIncrCount
     case mcount of
         Just count -> do
@@ -123,10 +122,13 @@ trackConcurrency state maxRequests' logCB action = do
             error errorText
   where
     maybeIncrCount = trackNamedSTM "maybeIncCount" $ do
+        -- prevent pools from blasting each other out
         count <- readTVar (concurrentCount state)
-        if (count < maxRequests')
-        then (writeTVar (concurrentCount state) (count + 1) >> return (Just $ count + 1))
-        else (return Nothing)
+        -- right now totally averse to drop through buckets
+        let isMaxPool = head $ tchooser buck count == maximum count
+        if (HM.foldl' (+) 0 count >= maxRequests' && isMaxPool)
+        then (return Nothing)
+        else (writeTVar (concurrentCount state) (count + 1) >> return (Just $ count + 1))
 
     decrCount = trackNamedSTM "decrCount" $ do
         count <- readTVar (concurrentCount state)
@@ -225,8 +227,8 @@ generateRequest (MontageEnvelope MONTAGE_ERROR _ _) = error "MONTAGE_ERROR is re
 generateRequest (MontageEnvelope MONTAGE_DELETE_RESPONSE _ _) = error "MONTAGE_DELETE_RESPONSE is reserved for responses from montage"
 generateRequest (MontageEnvelope DEPRICATED_MONTAGE_SET_REFERENCE _ _) = error "DEPRICATED_MONTAGE_SET_REFERENCE is deprecated!"
 
-processRequest :: (MontageRiakValue r) => ConcurrentState -> LogCallback -> PoolChooser -> ChainCommand r -> Stats -> Int -> Bool -> Bool -> IO CommandResponse
-processRequest state logCB chooser' cmd stats maxRequests' readOnly' logCommands' = do
+processRequest :: (MontageRiakValue r) => ConcurrentState -> LogCallback -> PoolChooser -> TrackChooser -> ChainCommand r -> Stats -> Int -> Bool -> Bool -> IO CommandResponse
+processRequest state logCB chooser' tchooser cmd stats maxRequests' readOnly' logCommands' = do
     when (readOnly' && (not $ isRead cmd)) $
       error "Non-read request issued to read-only montage"
 
@@ -235,7 +237,7 @@ processRequest state logCB chooser' cmd stats maxRequests' readOnly' logCommands
 
     pipelineGet state cmd tracker (processRequest' chooser' cmd stats)
   where
-    tracker = trackConcurrency state maxRequests' logCB
+    tracker = trackConcurrency state maxRequests' logCB tchooser
 
 processRequest' :: (MontageRiakValue r) => PoolChooser -> ChainCommand r -> Stats -> IO CommandResponse
 processRequest' chooser' cmd stats = do
@@ -250,9 +252,15 @@ processRequest' chooser' cmd stats = do
             cmd' <- ioCmd
             processRequest' chooser' cmd' stats
 
-runBackendCommands :: (MontageRiakValue r) => PoolChooser -> Stats -> [RiakRequest r] -> IO [RiakResponse r]
-runBackendCommands chooser' stats rs = do
-    waits <- mapM (runBackendCommand chooser' stats) rs
+-- change the semantics of concurrencies to be riak requests not montaged commands, so
+-- it's not just one per thread
+-- might not be completely ideal, because then you have no count of threads
+-- but then we abolished that with the pipelining stuff anyway
+
+-- something that extracts bucket from RiakRequest
+runBackendCommands :: (MontageRiakValue r) => (RT.Bucket -> IO (RiakResponse r) -> IO (RiakResponse r)) -> PoolChooser -> Stats -> [RiakRequest r] -> IO [RiakResponse r]
+runBackendCommands tracker chooser' stats rs = do
+    waits <- mapM (\r -> tracker (exposeBucket r) $ runBackendCommand chooser' stats r) rs
     results <- mapM takeMVar waits
     return $ map parseResponse results
   where
@@ -266,6 +274,7 @@ runBackendCommand' f = do
     void $ forkIO $ try f >>= putMVar wait
     return wait
 
+-- is there a way we could make tracking commands lazy until we get to here?
 runBackendCommand :: (MontageRiakValue r) => PoolChooser -> Stats -> RiakRequest r -> IO (MVar (Either SomeException (RiakResponse r)))
 runBackendCommand chooser' stats (RiakGet buck key) =
     runBackendCommand' $ doGet stats buck key chooser' $ opts $ getPB buck

@@ -12,6 +12,7 @@ import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Text as T
 import Network.Riak.Types
 import Data.Conduit.Pool (Pool)
+import qualified Data.HashMap.Strict as HM
 
 import Network.Riak (Resolvable(..))
 import qualified Network.Riak.Value as V
@@ -40,6 +41,7 @@ class (Show a) => MontageRiakValue a where
 
 class Poolable p where
     chooser :: p -> Bucket -> [Pool Connection]
+    poolnames :: p -> Bucket -> [PoolName]
 
 instance (MontageRiakValue a) => Resolvable (RiakRecord a) where
     -- force deserialization for resolution
@@ -131,9 +133,16 @@ data (MontageRiakValue a) => RiakRequest a = RiakGet Bucket Key
                                            | RiakPut VectorClock Bucket Key (RiakRecord a)
                                            | RiakDelete Bucket Key
 
+exposeBucket :: (MontageRiakValue a) => RiakRequest a -> Bucket
+exposeBucket (RiakGet b _) = b
+exposeBucket (RiakPut _ b _ _) = b
+exposeBucket (RiakDelete b _) = b
+
 type RiakResponse a = Maybe (RiakRecord a, VClock, Maybe Int)
 
+type PoolName = T.Text
 type PoolChooser = Bucket -> [Pool Connection]
+type TrackChooser = Bucket -> HM.HashMap PoolName Int -> [Int]
 
 type RawValue = S.ByteString
 type Specifier = T.Text

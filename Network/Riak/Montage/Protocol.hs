@@ -73,7 +73,8 @@ zmqRpcReply c inproc retid out = do
 serveMontageZmq :: (MontageRiakValue r) =>
                    (MontageEnvelope -> ChainCommand r) ->
                    String -> ConcurrentState -> LogCallback ->
-                   PoolChooser -> Stats -> Int -> Bool -> Bool -> IO ()
+                   PoolChooser -> TrackChooser
+                   Stats -> Int -> Bool -> Bool -> IO ()
 serveMontageZmq generate runOn state logCB chooser' stats maxRequests' readOnly' logCommands' = do
     runZmqRpc runOn wrapMontage
   where

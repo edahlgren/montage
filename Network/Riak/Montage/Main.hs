@@ -66,13 +66,13 @@ runDaemon cfg' pools = do
     stats <- initStats (statsPrefix cfg')
     mapM_ (addCounter stats) montageStats
 
-    state <- newEmptyConcurrentState
+    let (chooser', tchooser) = chooser ***  poolstate $ pools -- that's only for one bucket
+    state <- newEmptyConcurrentState -- you should just add keys on the fly
 
-    let chooser' = chooser pools
     let logging = logger cfg'
     let runOn = "tcp://*:" ++ show (proxyPort cfg')
 
-    void $ forkIO $ loggedSupervise logging "network-zeromq" $ serveMontageZmq (generator cfg') runOn state logging chooser' stats (maxRequests cfg') (readOnly cfg') (logCommands cfg')
+    void $ forkIO $ loggedSupervise logging "network-zeromq" $ serveMontageZmq (generator cfg') runOn state logging chooser' (HM.lookup pn  stats (maxRequests cfg') (readOnly cfg') (logCommands cfg')
     void $ forkIO $ loggedSupervise logging "timekeeper" $ timeKeeper stats
     void $ forkIO $ runStats stats (statsPort cfg')
     sleepForever
