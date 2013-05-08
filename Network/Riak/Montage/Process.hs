@@ -54,47 +54,10 @@ data ConcurrentState = ConcurrentState {
       concurrentCount :: TVar Int
     , tick            :: TVar Int
     , ts              :: TVar Double
-    , pipeline        :: TVar (HM.HashMap (RT.Bucket, RT.Key) (TMVar (Either SomeException CommandResponse)))
     }
 
 newEmptyConcurrentState :: IO ConcurrentState
-newEmptyConcurrentState = ConcurrentState <$> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO HM.empty
-
-pipelineGet :: (MontageRiakValue t) => ConcurrentState -> ChainCommand t
-            -> (Int -> IO CommandResponse -> IO CommandResponse)
-            -> Int -> IO CommandResponse -> IO CommandResponse
-pipelineGet state (ChainGet buck key Nothing) tracker requestTimeout' actuallyRun = do
-    opt <- eitherAnswerOrMandate
-    mans <- case opt of
-        Left tmv -> do
-            mans <- try $ tracker requestTimeout' actuallyRun
-            trackNamedSTM "non-pipelined" $ do
-                putTMVar tmv mans
-                hash <- readTVar (pipeline state)
-                let hash' = HM.delete hashkey hash
-                writeTVar (pipeline state) hash'
-            return mans
-        Right tmv -> do
-            logError $ "(key request for " ++ (show buck) ++ "/" ++ (show key) ++ " is pipelined)"
-            runWithTimeout requestTimeout' $ trackNamedSTM "pipelined" $ readTMVar tmv
-
-    case mans of
-        Left (e::SomeException) -> throw e
-        Right ans -> return ans
-  where
-    eitherAnswerOrMandate = trackNamedSTM "eitherAnswerOrMandate" $ do
-        hash <- readTVar (pipeline state)
-        case HM.lookup hashkey hash of
-            Just tmv -> return $ Right tmv
-            Nothing -> do
-                newTmv <- newEmptyTMVar
-                let hash' = HM.insert hashkey newTmv hash
-                writeTVar (pipeline state) hash'
-                return $ Left newTmv
-
-    hashkey = (buck, key)
-
-pipelineGet _ _ tracker requestTimeout' actuallyRun = tracker requestTimeout' actuallyRun
+newEmptyConcurrentState = ConcurrentState <$> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO 0
 
 runWithTimeout :: Int -> IO a -> IO a
 runWithTimeout requestTimeout' action = do
@@ -232,9 +195,7 @@ processRequest state chooser' cmd stats maxRequests' requestTimeout' readOnly' l
     when (logCommands') $
       logError $ "Running command " ++ show cmd
 
-    pipelineGet state cmd tracker requestTimeout' (processRequest' chooser' cmd stats)
-  where
-    tracker = trackConcurrency state maxRequests'
+    trackConcurrency state maxRequests' requestTimeout' (processRequest' chooser' cmd stats)
 
 processRequest' :: (MontageRiakValue r) => PoolChooser -> ChainCommand r -> Stats -> IO CommandResponse
 processRequest' chooser' cmd stats = do
