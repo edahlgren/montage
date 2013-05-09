@@ -3,7 +3,7 @@ module Network.Riak.Montage.Protocol where
 import System.ZMQ
 import System.UUID.V4 (uuid)
 import Control.Monad (forever)
-import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (MVar, takeMVar, putMVar)
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.ByteString.Lazy as BW
 import qualified Data.ByteString.Char8 as S
@@ -12,19 +12,20 @@ import Text.ProtocolBuffers.WireMessage (messageGet, messagePut)
 import Text.ProtocolBuffers.Basic (uFromString)
 import Data.Aeson (object, (.=))
 
+import Network.StatsWeb (Stats, incCounter)
+
 import Network.Riak.Montage.Util
-
-import Network.StatsWeb (Stats)
-
+import Network.Riak.Montage.Types
 import Network.Riak.Montage.Proto.Montage.MontageEnvelope as ME
 import Network.Riak.Montage.Proto.Montage.MontageWireMessages
 import Network.Riak.Montage.Proto.Montage.MontageError
-import Network.Riak.Montage.Types
 import Network.Riak.Montage.Process (processRequest,
-                                    serializeResponse, ConcurrentState(..))
+                                    serializeResponse)
 
 
-type ZmqHandler = (S.ByteString -> (BW.ByteString -> IO ()) -> IO ())
+type ZmqHandler = (S.ByteString -> ZmqCallback -> IO ())
+
+type ZmqCallback = (BW.ByteString -> IO ())
 
 runZmqRpc :: String
           -> ZmqHandler
@@ -37,7 +38,7 @@ runZmqRpcWithContext :: Context
                      -> String
                      -> ZmqHandler
                      -> IO ()
-runZmqRpcWithContext ctx binda call = do
+runZmqRpcWithContext ctx binda serve = do
     withSocket ctx Router (\s -> do
         rand <- uuid
         let inproc = "inproc://" ++ (show rand)
@@ -55,8 +56,7 @@ runZmqRpcWithContext ctx binda call = do
                 send s "" [SndMore]
                 send s m []
             else do -- call
-                _ <- forkIO $ call m (zmqRpcReply ctx inproc zid)
-                return ()
+                serve m (zmqRpcReply ctx inproc zid)
         )
 
 zmqRpcReply :: Context
@@ -71,29 +71,40 @@ zmqRpcReply c inproc retid out = do
         send s retid []
         )
 
-serveMontageZmq :: (MontageRiakValue r) =>
-                   (MontageEnvelope -> ChainCommand r) ->
-                   String -> ConcurrentState -> LogCallback ->
-                   PoolChooser -> Stats -> Int -> Int -> Bool -> Bool -> IO ()
-serveMontageZmq generate runOn state logCB chooser' stats maxRequests' requestTimeout' readOnly' logCommands' = do
-    runZmqRpc runOn wrapMontage
+serveMontageZmq :: MVar (S.ByteString, ZmqCallback) -> String -> Stats -> IO ()
+serveMontageZmq queueAny runOn stats = do
+    runZmqRpc runOn serveMontage
   where
-    wrapMontage m cb = do
+    serveMontage m cb = do
+        putMVar queueAny (m, cb)
+        incCounter "requests" stats
+
+processLoop :: (MontageRiakValue r) =>
+               MVar (S.ByteString, ZmqCallback) ->
+               (MontageEnvelope -> ChainCommand r) ->
+               LogCallback -> PoolChooser -> Stats ->
+               Int -> Bool -> Bool -> IO ()
+processLoop queueAny generate logCB chooser' stats requestTimeout' readOnly' logCommands' = do
+    forever $ do
+        (req, cb) <- takeMVar queueAny
+        wrapMontage req >>= cb
+  where
+    wrapMontage m = do
         case messageGet $ sTl m of
             Right (env, x) | B.length x == 0 -> do
                 res <- try $ do
                     let !cmd = generate env
-                    fmap (serializeResponse env) $ processRequest state chooser' cmd stats maxRequests' requestTimeout' readOnly' logCommands'
+                    fmap (serializeResponse env) $ processRequest chooser' cmd stats requestTimeout' readOnly' logCommands'
                 case res of
                     Left (e :: SomeException) -> returnError (show e) $ msgid env
-                    Right outenv -> cb $  messagePut outenv
+                    Right outenv -> return . messagePut $ outenv
 
             _ -> returnError "Failed to decode MontageEnvelope" Nothing
       where
         returnError err msgid' = do
             logError err
             logCB "EXCEPTION" Nothing $ object ["error" .=  err ]
-            cb $ messagePut $ MontageEnvelope {
+            return . messagePut $ MontageEnvelope {
                   mtype = MONTAGE_ERROR
                 , msg = messagePut $ MontageError (uFromString err)
                 , msgid = msgid'
