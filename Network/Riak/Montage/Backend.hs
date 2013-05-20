@@ -21,12 +21,16 @@ maxRetries = 3
 
 -- We can't actually put in the type signatures below, see
 -- http://www.haskell.org/haskellwiki/Type_families#Injectivity.2C_type_inference.2C_and_ambiguity
-retryOperation :: IO a -> IO a
+retryOperation :: IO (Either SomeException a) -> IO a
 retryOperation op =
     retryOperation' 0
   where
     --retryOperation' :: IO a -> Int -> IO a
-    retryOperation' retries = catch op (handleError retries)
+    retryOperation' retries = do
+        res <- op
+        case res of
+            Left (e :: SomeException) -> handleError retries e
+            Right res' -> return res'
 
     --handleError :: (Exception e) => Int -> e -> IO a
     handleError retries e = case retries > maxRetries of
